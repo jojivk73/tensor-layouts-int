@@ -1,14 +1,13 @@
 # MIT License — see LICENSE file for details.
 """XE4 GEMM + row softmax
 
-Functional port of the sycl-tla example examples/cute/tutorial/xe4/gemm_softmax_xe4.cpp, runnable on the CPU.
-A GEMM followed by a row-wise **softmax**, with an LDSM warp-row load so each row's scores are co-resident in a subgroup for the `fred.max` reduction.
+Full-execution-flow functional port of the sycl-tla example examples/cute/tutorial/xe4/gemm_softmax_xe4.cpp.
+GEMM then a row-wise softmax with an LDSM warp-row reduction.
 
-Run:  python examples/xe4/gemm_softmax_xe4.py
-Each section below is one operation; the same content is in gemm_softmax_xe4.ipynb as cells."""
+Run:  python examples/xe4/gemm_softmax_xe4.py"""
 
 # ----------------------------------------------------------------------
-# Setup — data + a tiny layout printer
+# Helpers — display + SLM copy
 # ----------------------------------------------------------------------
 import numpy as np
 np.set_printoptions(precision=2, suppress=True, linewidth=120)
@@ -16,95 +15,153 @@ from tensor_layouts import Layout, size
 from tensor_layouts.analysis import is_bijective
 from tensor_layouts.atoms_xe_common import make_slm_layout_elem, sizeof_bits
 
+# ---- display helpers (reused by every cell below) ----
+def show_mat(name, X, r=4, c=8):
+    X = np.asarray(X)
+    print(name, " shape", X.shape)
+    print(X[:r, :c] if X.ndim == 2 else X[:c])
+    if X.ndim == 2 and (X.shape[0] > r or X.shape[1] > c):
+        print("   ...(showing %dx%d of %dx%d)" % (min(r, X.shape[0]), min(c, X.shape[1]), *X.shape))
+
 def show_layout(layout, n_rows, n_cols, rl="m", cl="k", max_r=8, max_c=8):
-    "Print coord -> memory offset for a rank-2 layout (truncated)."
     R, C = min(n_rows, max_r), min(n_cols, max_c)
     print("      " + "".join((cl + str(j)).ljust(5) for j in range(C)) + (" ..." if C < n_cols else ""))
     for i in range(R):
         print((" " + rl + str(i)).ljust(6) + "".join(str(layout(i, j)).ljust(5) for j in range(C))
               + (" ..." if C < n_cols else ""))
     if R < n_rows:
-        print("  ...  (%dx%d total)" % (n_rows, n_cols))
+        print("   ...(%dx%d total)" % (n_rows, n_cols))
 
-M, N, K = 32, 32, 16          # A rows, B rows, contraction
+def check(name, cond):
+    print(("[PASS] " if cond else "[FAIL] ") + name)
+
+# ---- SLM staging helpers: gmem tile <-> bank-swizzled SLM buffer ----
+def load_to_slm(mat, lay):
+    buf = np.zeros(size(lay), dtype=mat.dtype)
+    for i in range(mat.shape[0]):
+        for j in range(mat.shape[1]):
+            buf[lay(i, j)] = mat[i, j]
+    return buf
+
+def read_slm(buf, lay, r, c):
+    return np.array([[buf[lay(i, j)] for j in range(c)] for i in range(r)])
+
+print("helpers ready: show_mat, show_layout, check, load_to_slm, read_slm")
+
+# ----------------------------------------------------------------------
+# Setup — allocate + initialize operands
+# ----------------------------------------------------------------------
+# Problem setup: allocate and initialize the operands (small so tables print).
+M, N, K = 32, 32, 64
+BLK_M, BLK_N, BLK_K = 32, 32, 16
+K_TILE = K // BLK_K            # number of K-tiles in the mainloop
+K_PIPE = 2                    # SLM pipeline stages (StagesA)
+alpha, beta = 1.0, 0.0
+DT = "bf16"; DBITS = sizeof_bits(DT)
 rng = np.random.default_rng(0)
-A = rng.integers(-2, 3, size=(M, K)).astype(np.float32)   # A  (M x K)
-B = rng.integers(-2, 3, size=(N, K)).astype(np.float32)   # B  (N x K), used as B^T
-print("A", A.shape, " B", B.shape)
-print("A[:4]:\n", A[:4])
+A = rng.integers(-2, 3, size=(M, K)).astype(np.float32)   # A (M x K) row-major
+B = rng.integers(-2, 3, size=(N, K)).astype(np.float32)   # B (N x K); B^T used in the GEMM
+C = rng.integers(0, 2, size=(M, N)).astype(np.float32)    # C (M x N) input accumulator
+show_mat("A (M x K)", A); show_mat("B (N x K)", B)
 
 # ----------------------------------------------------------------------
-# Step — ADMA load: gmem → SLM (bank-swizzled)
+# Config
 # ----------------------------------------------------------------------
-# ADMA load: move A from global memory into SLM through the Xe bank-swizzled
-# core-matrix layout, then read it back to prove the mapping is loss-less.
-slm = make_slm_layout_elem(sizeof_bits("bf16"), M, K)
-print("SLM layout:", slm, " bijective:", is_bijective(slm), " size:", size(slm))
-print("\n(m,k) -> SLM offset  (note the bank jumps down a column):")
-show_layout(slm, M, K)
-slm_buf = np.zeros(size(slm), dtype=np.float32)
-for m in range(M):
-    for k in range(K):
-        slm_buf[slm(m, k)] = A[m, k]
-A_back = np.array([[slm_buf[slm(m, k)] for k in range(K)] for m in range(M)])
-print("\nSLM round-trip recovers A exactly:", np.array_equal(A_back, A))
+from tensor_layouts.atoms_xe4 import make_xe4_amma_atom
+atom = make_xe4_amma_atom("f32", DT, DT, "f32", BLK_M, BLK_N, BLK_K, tracking="AB")
+slmA = make_slm_layout_elem(DBITS, BLK_M, BLK_K)
+slmB = make_slm_layout_elem(DBITS, BLK_N, BLK_K)
+print("MMA atom :", atom.name)
+print("CTA tile :", (BLK_M, BLK_N, BLK_K), " K-tiles:", K_TILE, " pipeline stages:", K_PIPE)
 
 # ----------------------------------------------------------------------
-# Step — MMA: S = A · Bᵀ
+# Tiling — CTA grid + K-tiles
 # ----------------------------------------------------------------------
-# MMA: the systolic multiply computes S = A . B^T.
-S = A @ B.T
-print("S = A . B^T  shape", S.shape, "\n", S[:4, :8], "...")
-aM, aN, aK = 32, 32, 16
-print("accumulator grid: %d x %d x %d atom tile(s)  (atom %dx%dx%d)"
-      % (M // aM, N // aN, max(K // aK, 1), aM, aN, aK))
-C = Layout((N, M), (M, 1))   # (thread=col of B, value=row of A) -> element, col-major M x N
-print("C accumulator (thread, value) -> element offset:")
-show_layout(C, N, M, rl="t", cl="v")
+# Partition the problem: CTA grid over (M,N), and K split into K_TILE tiles.
+print("CTA grid (M,N):", (M // BLK_M, N // BLK_N), "   K-tiles per CTA:", K_TILE)
+a_kt = [A[:, k * BLK_K:(k + 1) * BLK_K] for k in range(K_TILE)]   # A K-tiles (M x BLK_K)
+b_kt = [B[:, k * BLK_K:(k + 1) * BLK_K] for k in range(K_TILE)]   # B K-tiles (N x BLK_K)
+show_mat("A K-tile 0 (M x BLK_K)", a_kt[0])
 
 # ----------------------------------------------------------------------
-# Step — row softmax: S → P
+# SLM staging
 # ----------------------------------------------------------------------
-# Row softmax over the N columns of S (numerically stable): subtract the row
-# max, exponentiate, divide by the row sum -> probabilities P.
+# SLM staging: each K-tile is copied into a bank-swizzled SLM buffer.
+print("SLM A stage layout (m,k) -> SLM offset (bank-swizzled):")
+show_layout(slmA, BLK_M, BLK_K)
+_probe = load_to_slm(a_kt[0], slmA)
+check("SLM stage round-trip is loss-less", np.array_equal(read_slm(_probe, slmA, BLK_M, BLK_K), a_kt[0]))
+
+# ----------------------------------------------------------------------
+# Clear the accumulator
+# ----------------------------------------------------------------------
+# Clear the accumulator fragment (lives in registers on hardware).
+acc = np.zeros((BLK_M, BLK_N), dtype=np.float32)
+show_mat("cleared accumulator", acc)
+
+# ----------------------------------------------------------------------
+# Prologue
+# ----------------------------------------------------------------------
+# Prologue: fill the first K_PIPE SLM pipeline stages (double-buffering).
+slm_pipe_a = [load_to_slm(a_kt[p], slmA) for p in range(min(K_PIPE, K_TILE))]
+slm_pipe_b = [load_to_slm(b_kt[p], slmB) for p in range(min(K_PIPE, K_TILE))]
+print("prologue filled", len(slm_pipe_a), "of", K_PIPE, "SLM stages;", K_TILE, "K-tiles total")
+
+# ----------------------------------------------------------------------
+# Mainloop — K-loop MMA -> scores S
+# ----------------------------------------------------------------------
+# Mainloop: for each K-tile, load it into SLM (producer) and accumulate the
+# partial product into acc (consumer MMA). This is the K-reduction.
+for kt in range(K_TILE):
+    a_k = read_slm(load_to_slm(a_kt[kt], slmA), slmA, BLK_M, BLK_K)   # staged through SLM
+    b_k = b_kt[kt]
+    acc += a_k @ b_k.T                                               # cute::gemm accumulate
+    if kt == 0:
+        show_mat("acc after K-tile 0", acc)
+show_mat("acc after full K-loop", acc)
+check("acc == A . B^T", np.allclose(acc, A @ B.T))
+
+# ----------------------------------------------------------------------
+# Softmax epilogue
+# ----------------------------------------------------------------------
+# Softmax epilogue: row-wise softmax of the scores S = acc.
+S = acc
 row_max = S.max(axis=1, keepdims=True)
-S_exp = np.exp(S - row_max)
-row_sum = S_exp.sum(axis=1, keepdims=True)
-P = S_exp / row_sum
-print("row_max:", row_max.ravel()[:6], "...")
-print("P[0,:6]:", P[0, :6], "  row 0 sums to", P[0].sum())
+P = np.exp(S - row_max)
+P = P / P.sum(axis=1, keepdims=True)
+show_mat("row_max", row_max)
+show_mat("P = softmax(S)", P)
+check("each row sums to 1", np.allclose(P.sum(1), 1.0))
 
 # ----------------------------------------------------------------------
-# Step — LDSM warp-row (fred.max)
+# LDSM warp-row reduction
 # ----------------------------------------------------------------------
-# LDSM warp-row epilogue: XE4_LDSM loads the result so a full row is
-# co-resident in one 32-lane subgroup (row-mates share a warp).
+# LDSM warp-row: the softmax reduction needs each row co-resident in one
+# 32-lane subgroup. Show the lane assignment and the in-warp max for row 0.
 from tensor_layouts.atoms_xe4 import make_xe4_ldstm
-ldsm = make_xe4_ldstm("LDSM", VS=8, s="bf16")
+ldsm = make_xe4_ldstm("LDSM", VS=8, s=DT)
 print("LDSM atom:", ldsm.name, " ThrID =", size(ldsm.thr_id), "lanes")
-row = 0
-warp = {t: S[row, t] for t in range(min(N, 32))}
-print("row", row, "across lanes 0..7:", [warp[t] for t in range(8)])
-print("in-warp max =", max(warp.values()),
-      " matches numpy:", max(warp.values()) == S[row, :min(N, 32)].max())
+warp = {t: acc[0, t] for t in range(min(N, 32))}
+show_mat("row 0 scores across lanes", np.array([warp[t] for t in range(min(N, 32))]).reshape(1, -1))
+check("in-warp max == numpy row max", max(warp.values()) == acc[0, :min(N, 32)].max())
 
 # ----------------------------------------------------------------------
-# Step — ADMA store P
+# Store P → gmem
 # ----------------------------------------------------------------------
-# ADMA store: write P back to global memory through the SLM core matrix
-# (reverse of the load) and confirm it is loss-less.
-res = P
-slm_o = make_slm_layout_elem(sizeof_bits("bf16"), res.shape[0], res.shape[1])
-print("result corner (to be stored):\n", res[:3, :6], "...")
-obuf = np.zeros(size(slm_o), dtype=res.dtype)
-for i in range(res.shape[0]):
-    for j in range(res.shape[1]):
-        obuf[slm_o(i, j)] = res[i, j]
-print("SLM store offsets for rows 0..3, col 0:", [slm_o(i, 0) for i in range(min(4, res.shape[0]))])
-back = np.array([[obuf[slm_o(i, j)] for j in range(res.shape[1])] for i in range(res.shape[0])])
-print("store round-trip matches result:", np.array_equal(back, res))
+slmP = make_slm_layout_elem(DBITS, M, N)
+pbuf = load_to_slm(P, slmP)
+check("store round-trip", np.array_equal(read_slm(pbuf, slmP, M, N), P))
+
+# ----------------------------------------------------------------------
+# Reference + validation
+# ----------------------------------------------------------------------
+S_ref = A @ B.T
+Pr = np.exp(S_ref - S_ref.max(1, keepdims=True)); Pr = Pr / Pr.sum(1, keepdims=True)
+err = np.abs(P - Pr).max()
+print("max abs error vs softmax reference:", err)
+check("softmax verification", err < 1e-6)
 
 # ----------------------------------------------------------------------
 # Recap
 # ----------------------------------------------------------------------
-print('Recap: load → MMA → softmax → LDSM warp-row → store P.')
+print('Recap: load → K-loop MMA → softmax → LDSM warp-row → store → validate.')
