@@ -124,6 +124,54 @@ class TestDPASStructural:
             assert ns.pop() == t
 
 
+from tensor_layouts.atoms_xe import MMA_ATOMS_XE, COPY_ATOMS_XE
+
+
+def _sz_thr(layout):
+    return size(layout.shape[0]) if isinstance(layout.shape, tuple) else size(layout.shape)
+
+
+def _sz_val(layout):
+    return size(layout.shape[1]) if isinstance(layout.shape, tuple) else 1
+
+
+@pytest.mark.parametrize("atom", MMA_ATOMS_XE, ids=lambda a: a.name)
+class TestFaithfulXeDPAS:
+    """Invariants for the sycl-tla-faithful XE_DPAS_TT atoms (subgroup = 16)."""
+
+    def test_subgroup_is_16(self, atom):
+        assert size(atom.thr_id) == 16
+        assert atom.shape_mnk[1] == 16  # N is fixed at 16
+
+    def test_c_covers_mn(self, atom):
+        m, n, k = atom.shape_mnk
+        c = atom.c_layout
+        offs = [c(t, v) for t in range(_sz_thr(c)) for v in range(_sz_val(c))]
+        assert set(offs) == set(range(m * n))
+
+    def test_a_covers_mk(self, atom):
+        m, n, k = atom.shape_mnk
+        a = atom.a_layout
+        offs = {a(t, v) for t in range(_sz_thr(a)) for v in range(_sz_val(a))}
+        assert offs == set(range(m * k))
+
+    def test_b_covers_nk(self, atom):
+        m, n, k = atom.shape_mnk
+        b = atom.b_layout
+        offs = {b(t, v) for t in range(_sz_thr(b)) for v in range(_sz_val(b))}
+        assert offs == set(range(n * k))
+
+
+@pytest.mark.parametrize("atom", COPY_ATOMS_XE, ids=lambda a: a.name)
+class TestFaithfulXeCopy:
+    def test_layouts_rank_two(self, atom):
+        assert rank(atom.src_layout_bits) == 2
+        assert rank(atom.dst_layout_bits) == 2
+
+    def test_thrid_positive(self, atom):
+        assert size(atom.thr_id) >= 1
+
+
 if __name__ == "__main__":
     import subprocess
     import sys

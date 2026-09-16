@@ -133,6 +133,34 @@ print(atom.c_layout)    # Thread-value layout for C accumulator
 Supported targets: Xe-HPC (Ponte Vecchio / Data Center Max) and
 Xe-HPG (Arc / DG2) subgroup DPAS instructions.
 
+### Intel Xe / Xe4 / Xe5 atoms (sycl-tla-faithful)
+
+Beyond the pedagogical DPAS atoms above, the library ships **CPU-executable
+emulations of every MMA and Copy atom** in the Intel sycl-tla (CUTLASS-Xe)
+fork, translated directly from the C++ `MMA_Traits<>` / `Copy_Traits<>`:
+
+```python
+from tensor_layouts.atoms_xe  import MMA_ATOMS_XE, COPY_ATOMS_XE   # XE_DPAS_TT, 1D/2D copies
+from tensor_layouts.atoms_xe4 import MMA_ATOMS_XE4, COPY_ATOMS_XE4  # TMM, AMMA, ADMA, LDSM, EU_COPY
+from tensor_layouts.atoms_xe5 import MMA_ATOMS_XE5, COPY_ATOMS_XE5  # single/dual-group AMMA, MX
+from tensor_layouts.atoms_xe_common import wi_interleave, make_slm_layout_elem
+```
+
+- **`atoms_xe`** — faithful `XE_DPAS_TT` (subgroup 16, VNNI `wi_interleave`) plus
+  the Xe 1D/2D block copies.
+- **`atoms_xe4`** — `XE4_TMM` (register MMA), `XE4_AMMA` (SLM-descriptor MMA, all
+  barrier-tracking + block-scaled variants), and the ADMA / LDSM / EU_COPY /
+  matrix copies. Subgroup 32.
+- **`atoms_xe5`** — single-group **and dual-group** (`ThrID=2`) AMMA, LARGE
+  core-matrix and block-scaled MX (incl. fp6) variants, plus ADMA dual / GCS
+  copies.
+- **`atoms_xe_common`** — the shared transforms: `wi_interleave`,
+  `xe_interleaved_layout`, `make_ordered_layout`, and the bank-swizzled SLM
+  **core-matrix** layout builders that the AMMA/ADMA descriptors reference.
+
+Structural tests live in `tests/oracle_xe{,4,5}.py`; see
+[`docs/xe_atoms.md`](docs/xe_atoms.md) and the worked example notebooks below.
+
 ### Intel AMX Atoms
 
 ```python
@@ -187,6 +215,26 @@ gallery of layout, swizzle, MMA atom, and tiled MMA visualizations, and the
 - [Algorithms Notebook](https://github.com/facebookresearch/tensor-layouts/blob/main/examples/algorithms.ipynb) — `algorithms.ipynb`: derivations of compose, complement, divide, product
 - [Applications Notebook](https://github.com/facebookresearch/tensor-layouts/blob/main/examples/applications.ipynb) — `applications.ipynb`: applied examples (paper-style)
 - [GEMM Notebook](https://github.com/facebookresearch/tensor-layouts/blob/main/examples/gemm.ipynb) — `gemm.ipynb`: a fully explained NVIDIA GEMM kernel built up using layout algebra
+
+#### Intel Xe4 / Xe5 atom & kernel notebooks
+
+- [`examples/xe_atoms.ipynb`](examples/xe_atoms.ipynb) — overview of the Xe/Xe4/Xe5 atom families and their layout transformations (DPAS `wi_interleave`, SLM core matrix, EU copy, dual-group).
+- [`examples/xe4_atoms.ipynb`](examples/xe4_atoms.ipynb) / [`examples/xe5_atoms.ipynb`](examples/xe5_atoms.ipynb) — every atom in each family, layouts printed and drawn.
+- **[`examples/xe4/`](examples/xe4/) and [`examples/xe5/`](examples/xe5/)** — one **self-contained functional notebook + runnable script** per sycl-tla tutorial example under `examples/cute/tutorial/{xe4,xe5}/`, including the **FMHA4 forward** attention ([`examples/xe4/fmha4_fwd_xe4.ipynb`](examples/xe4/fmha4_fwd_xe4.ipynb)). Each works cell by cell through load → MMA → reduce/softmax/dual-split → epilogue → store on small concrete data, printing the actual numbers and the matching Xe layout at each step (SLM swizzle round-trips, accumulator ownership, LDSM warp-row co-residence, block-scale application, GCS zero-fill). See the per-directory `README.md`.
+- [`examples/xe4_xe5_kernels.py`](examples/xe4_xe5_kernels.py) — cross-config tiling summary (GEMM 256×256×128, grouped, block-scaled, dual-group, FMHA4) showing how each CTA tile decomposes into MMA-atom tiles.
+
+## What's new — Intel Xe4 / Xe5 support
+
+This fork adds a complete, GPU-free emulation of the Intel Xe4/Xe5 CuTe atom
+layer on top of the original NVIDIA/AMD layout-algebra library:
+
+- **New source modules** `atoms_xe_common`, `atoms_xe4`, `atoms_xe5` and an
+  extended `atoms_xe` (see [Intel Xe / Xe4 / Xe5 atoms](#intel-xe--xe4--xe5-atoms-sycl-tla-faithful)).
+- **Structural test suites** `tests/oracle_xe{,4,5}.py`.
+- **Educational example suite**: 28 self-contained functional notebooks + scripts
+  (`examples/xe4/`, `examples/xe5/`) porting the sycl-tla tutorial GEMMs and the
+  FMHA4 forward kernel, plus atom-family and overview notebooks.
+- **Docs**: [`docs/xe_atoms.md`](docs/xe_atoms.md).
 
 ## Testing
 

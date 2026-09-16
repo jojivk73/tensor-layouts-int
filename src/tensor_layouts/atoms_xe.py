@@ -88,8 +88,11 @@ Usage::
     print(XeHPC_8x8x8_F32F16F16_DPAS.c_layout)
 """
 
-from .atoms import MMAAtom
-from .layouts import Layout
+from .atoms import MMAAtom, CopyAtom
+from .layouts import Layout, as_tuple
+from .atoms_xe_common import (
+    sizeof_bits, wi_interleave, xe_interleaved_layout, SG_SIZE_XE,
+)
 
 
 # =============================================================================
@@ -238,3 +241,222 @@ MMA_ATOMS_XeHPG = [
     XeHPG_8x16x8_F32BF16BF16_DPAS,
     XeHPG_8x16x8_I32I8I8_DPAS,
 ]
+
+
+# =============================================================================
+# =============================================================================
+# Faithful sycl-tla (CUTLASS-Xe) atoms — translated from the actual traits in
+# include/cute/atom/mma_traits_xe.hpp and copy_traits_xe{,_2d}.hpp.
+#
+# These differ from the pedagogical DPAS atoms above: the real Xe subgroup is
+# **16 lanes** (N is fixed at 16), K = 256 / max(bits(A), bits(B)), and the A/B
+# operands are VNNI / work-item interleaved via detail::wi_interleave.
+# =============================================================================
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# XE_DPAS_TT<M, TD, TA, TB, TC>  —  mma_traits_xe.hpp:66
+# -----------------------------------------------------------------------------
+
+def make_xe_dpas_atom(name, td, ta, tb, tc, M=8):
+    """Create a faithful XE_DPAS_TT atom (subgroup = 16 lanes).
+
+    Args:
+        td, ta, tb, tc: dtype names (keys of atoms_xe_common.SIZEOF_BITS) for
+                        D (accum out), A, B, C (accum in).
+        M: repeat_count (rows of D), 1..8.  N is always 16.
+    """
+    bA, bB = sizeof_bits(ta), sizeof_bits(tb)
+    K = 256 // max(bA, bB)
+    BV = 32 // bB
+    a_layout = wi_interleave(bA, Layout((K, M), (M, 1)), SG_SIZE_XE)
+    b_layout = wi_interleave(bB, Layout((BV, 16, K // BV), (16, 1, 16 * BV)),
+                             SG_SIZE_XE)
+    c_layout = Layout((16, M), (M, 1))
+    return MMAAtom(
+        name=name,
+        ptx=f"dpas.{K // BV}x{M} (exec=16, {ta}x{tb}->{td})",
+        shape_mnk=(M, 16, K),
+        thr_id=Layout(SG_SIZE_XE),
+        a_layout=a_layout, b_layout=b_layout, c_layout=c_layout,
+    )
+
+
+# (D, A, B, C) tuples always compiled in — mma_xe.hpp:230-252.  N=16, M=8.
+_XE_DPAS_TYPES = [
+    ("f32", "tf32", "tf32", "f32"),
+    ("f32", "bf16", "bf16", "f32"),
+    ("bf16", "bf16", "bf16", "f32"),
+    ("f32", "bf16", "bf16", "bf16"),
+    ("bf16", "bf16", "bf16", "bf16"),
+    ("f32", "f16", "f16", "f32"),
+    ("f32", "f16", "f16", "f16"),
+    ("f16", "f16", "f16", "f32"),
+    ("f16", "f16", "f16", "f16"),
+    ("u32", "u8", "u8", "u32"),
+    ("s32", "u8", "u8", "s32"),
+    ("s32", "u8", "s8", "s32"),
+    ("s32", "s8", "u8", "s32"),
+    ("s32", "s8", "s8", "s32"),
+    ("u32", "u4", "u4", "u32"),
+    ("s32", "u4", "u4", "s32"),
+    ("s32", "u4", "s4", "s32"),
+    ("s32", "s4", "u4", "s32"),
+    ("s32", "s4", "s4", "s32"),
+]
+
+
+def _dpas_name(td, ta, tb, tc, M):
+    up = lambda s: s.upper()  # noqa: E731
+    K = 256 // max(sizeof_bits(ta), sizeof_bits(tb))
+    return f"XE_DPAS_{M}x16x{K}_{up(td)}{up(ta)}{up(tb)}{up(tc)}"
+
+
+MMA_ATOMS_XE = [
+    make_xe_dpas_atom(_dpas_name(td, ta, tb, tc, 8), td, ta, tb, tc, M=8)
+    for (td, ta, tb, tc) in _XE_DPAS_TYPES
+]
+
+# Bind each as a module-level name (XE_DPAS_8x16x16_F32BF16BF16F32, ...).
+for _atom in MMA_ATOMS_XE:
+    globals()[_atom.name] = _atom
+
+
+# =============================================================================
+# XE 1D copy atoms — copy_traits_xe.hpp (bit-coordinate layouts)
+# =============================================================================
+
+def _xe_1d_atomic(s="f32", d=None):
+    d = d or s
+    return CopyAtom(
+        name=f"XE_ATOMIC_{s.upper()}",
+        ptx="atomic_ref add (global)",
+        thr_id=Layout(1),
+        src_layout_bits=Layout((1, sizeof_bits(s))),
+        dst_layout_bits=Layout((1, sizeof_bits(d))))
+
+
+def _xe_1d_slm(op, s="bf16", d=None):
+    """XE_1D_LDSM (SLM->reg) / XE_1D_STSM (reg->SLM): single-thread, all bits."""
+    d = d or s
+    return CopyAtom(
+        name=f"XE_1D_{op}_{s.upper()}",
+        ptx=f"lsc_{'load' if op == 'LDSM' else 'store'}.slm",
+        thr_id=Layout(1),
+        src_layout_bits=Layout((1, sizeof_bits(d))),
+        dst_layout_bits=Layout((1, sizeof_bits(d))))
+
+
+def make_xe_1d_load_global(s="bf16", d=None):
+    """XE_1D_LOAD_GLOBAL — subgroup (16-lane) global load. copy_traits_xe.hpp:68."""
+    d = d or s
+    bs, bd = sizeof_bits(s), sizeof_bits(d)
+    return CopyAtom(
+        name=f"XE_1D_LOAD_GLOBAL_{s.upper()}",
+        ptx="lsc load (global, subgroup)",
+        thr_id=Layout(SG_SIZE_XE),
+        src_layout_bits=Layout((SG_SIZE_XE, bs), (0, 1)),
+        dst_layout_bits=Layout((SG_SIZE_XE, (bd // bs, bs)),
+                               (bs, (bs * SG_SIZE_XE, 1))))
+
+
+def make_xe_1d_store_global(s="bf16", d=None):
+    """XE_1D_STORE_GLOBAL — subgroup (16-lane) global store. copy_traits_xe.hpp:93."""
+    d = d or s
+    bs, bd = sizeof_bits(s), sizeof_bits(d)
+    return CopyAtom(
+        name=f"XE_1D_STORE_GLOBAL_{d.upper()}",
+        ptx="lsc store (global, subgroup)",
+        thr_id=Layout(SG_SIZE_XE),
+        src_layout_bits=Layout((SG_SIZE_XE, (bs // bd, bd)),
+                               (bd, (bd * SG_SIZE_XE, 1))),
+        dst_layout_bits=Layout((SG_SIZE_XE, bd), (0, 1)))
+
+
+COPY_ATOMS_XE_1D = [
+    _xe_1d_atomic("f32"),
+    _xe_1d_slm("LDSM", "bf16"),
+    _xe_1d_slm("STSM", "bf16"),
+    make_xe_1d_load_global("bf16"),
+    make_xe_1d_load_global("f32"),
+    make_xe_1d_store_global("bf16"),
+]
+
+for _atom in COPY_ATOMS_XE_1D:
+    globals()[_atom.name] = _atom
+
+
+# =============================================================================
+# XE 2D block copy atoms — copy_traits_xe_2d.hpp
+# The (thr, val) -> (x-bit, y) layouts are built by XeInterleavedLayout.
+# =============================================================================
+
+def _replace_mode0_broadcast(layout, threads=SG_SIZE_XE):
+    """replace<0>(L, Layout<Shape<SGSize>, Stride<_0>>) — for 2D load/store src."""
+    shape = (threads,) + tuple(as_tuple(layout.shape))[1:]
+    stride = (0,) + tuple(as_tuple(layout.stride))[1:]
+    return Layout(shape, stride)
+
+
+def make_xe_load_2d(bits, H, W, block_w=None, val="bf16"):
+    """XE_LOAD_2D<CopyBits,H,W,BlockWidth> — 2D block load .nn. traits :483."""
+    block_w = block_w or W
+    vb = sizeof_bits(val)
+    dst = xe_interleaved_layout(
+        Layout((block_w, H, W // block_w), (1, W, block_w)), bits, vb)
+    src = _replace_mode0_broadcast(dst)
+    return CopyAtom(
+        name=f"XE_LOAD_2D_{bits}b_{H}x{W}",
+        ptx=f"load 2d .nn {H}x{W} ({bits}b)",
+        thr_id=Layout(SG_SIZE_XE),
+        src_layout_bits=src, dst_layout_bits=dst)
+
+
+def make_xe_load_2d_transpose(bits, H, W, val="f32"):
+    """XE_LOAD_2D_TRANSPOSE<CopyBits,H,W> — transposing load .tn. traits :523."""
+    vb = sizeof_bits(val)
+    dst = xe_interleaved_layout(Layout((H, W), (W, 1)), bits, vb)
+    src = _replace_mode0_broadcast(dst)
+    return CopyAtom(
+        name=f"XE_LOAD_2D_TRANSPOSE_{bits}b_{H}x{W}",
+        ptx=f"load 2d .tn (transpose) {H}x{W} ({bits}b)",
+        thr_id=Layout(SG_SIZE_XE),
+        src_layout_bits=src, dst_layout_bits=dst)
+
+
+def make_xe_store_2d(bits, H, W, val="f32"):
+    """XE_STORE_2D<CopyBits,H,W> — 2D block store .nn. traits :542."""
+    vb = sizeof_bits(val)
+    src = xe_interleaved_layout(Layout((W, H)), bits, vb)
+    dst = _replace_mode0_broadcast(src)
+    return CopyAtom(
+        name=f"XE_STORE_2D_{bits}b_{H}x{W}",
+        ptx=f"store 2d .nn {H}x{W} ({bits}b)",
+        thr_id=Layout(SG_SIZE_XE),
+        src_layout_bits=src, dst_layout_bits=dst)
+
+
+def make_xe_prefetch_2d(bits, H, W, val="bf16"):
+    """XE_PREFETCH_2D<CopyBits,H,W> — 2D block prefetch to %null. traits :591."""
+    vb = sizeof_bits(val)
+    dst = xe_interleaved_layout(Layout((W, H)), bits, vb)
+    return CopyAtom(
+        name=f"XE_PREFETCH_2D_{bits}b_{H}x{W}",
+        ptx=f"prefetch 2d {H}x{W} ({bits}b)",
+        thr_id=Layout(SG_SIZE_XE),
+        src_layout_bits=dst, dst_layout_bits=dst)
+
+
+COPY_ATOMS_XE_2D = [
+    make_xe_load_2d(16, 16, 16, val="bf16"),
+    make_xe_load_2d(32, 8, 16, val="f32"),
+    make_xe_load_2d_transpose(32, 16, 8, val="f32"),
+    make_xe_store_2d(32, 8, 16, val="f32"),
+    make_xe_prefetch_2d(16, 16, 16, val="bf16"),
+]
+
+for _atom in COPY_ATOMS_XE_2D:
+    globals()[_atom.name] = _atom
+
+
+COPY_ATOMS_XE = COPY_ATOMS_XE_1D + COPY_ATOMS_XE_2D
