@@ -11,6 +11,35 @@ A pure-Python implementation of the [NVIDIA CuTe](https://github.com/NVIDIA/cutl
 
 Note that tensor-layouts is now maintained out of [https://github.com/jduprat/tensor-layouts.git](https://github.com/jduprat/tensor-layouts.git)
 
+---
+
+## 🟦 This fork: Intel Xe / Xe4 / Xe5 support
+
+This fork extends tensor-layouts with **CPU-executable emulations of the Intel
+Xe GPU MMA and Copy atoms** from the sycl-tla (CUTLASS-Xe) headers, plus a suite
+of **fully worked, runnable example kernels** — so you can watch a real Xe4/Xe5
+GEMM or Flash-Attention flow execute, tile by tile, entirely on the CPU.
+
+- **Atoms** — faithful `XE_DPAS_TT`, `XE4_TMM`, `XE4_AMMA`, ADMA / LDSM / EU-copy,
+  and Xe5 single/dual-group AMMA + block-scaled MX, translated straight from the
+  C++ `MMA_Traits<>` / `Copy_Traits<>`.
+  → [Intel Xe / Xe4 / Xe5 atoms](#intel-xe--xe4--xe5-atoms-sycl-tla-faithful)
+- **Worked example kernels** — one **full-execution-flow** notebook **and** an
+  equivalent runnable script per sycl-tla tutorial example
+  (`examples/xe4/`, `examples/xe5/`), including **FMHA4 forward attention**.
+  Each reproduces the real kernel flow — setup → config → tiling → SLM staging →
+  clear accumulator → prologue → **K-loop mainloop** → epilogue → store →
+  **reference validation** — with one operation per cell and a shared display
+  helper.  → [Intel Xe4 / Xe5 atom & kernel notebooks](#intel-xe4--xe5-atom--kernel-notebooks)
+- **Details** — [`docs/xe_atoms.md`](docs/xe_atoms.md), the per-directory
+  `examples/xe4/README.md` and `examples/xe5/README.md`, and the
+  [What's new](#whats-new--intel-xe4--xe5-support) summary below.
+
+Everything runs with no GPU: a `Layout` is a callable `L(coord…) -> offset`, and
+the atom traits, SLM bank-swizzle, and kernel dataflow are reproduced in pure
+Python + NumPy.
+
+---
 
 CuTe layouts describe how logical coordinates map to memory offsets on GPUs.
 This library lets you construct, compose, and visualize those layouts using
